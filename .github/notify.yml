@@ -1,0 +1,199 @@
+########################################################################
+# SHARED NOTIFICATION WORKFLOW
+# Reusable workflow — call from any pipeline with `uses: ./.github/workflows/notify.yml`
+# Sends notifications to Discord, Email, and/or Slack on pipeline success or failure.
+########################################################################
+name: 📣 Notifications
+
+on:
+  workflow_call:
+    inputs:
+      status:
+        description: "Job result: success | failure | cancelled | skipped"
+        required: true
+        type: string
+      pipeline:
+        description: "Human-readable pipeline name (e.g. 'Frontend – Test')"
+        required: true
+        type: string
+      version:
+        description: "Version or tag being deployed"
+        required: false
+        type: string
+        default: "N/A"
+      environment:
+        description: "Target environment (test | uat | pre-production | production)"
+        required: false
+        type: string
+        default: "N/A"
+      tribe:
+        description: "Tribe name"
+        required: false
+        type: string
+        default: ""
+      system:
+        description: "System name (for multi-system repos)"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      DISCORD_WEBHOOK_URL:
+        required: false
+      SLACK_WEBHOOK_URL:
+        required: false
+      NOTIFY_EMAIL_TO:
+        required: false
+      SMTP_SERVER:
+        required: false
+      SMTP_PORT:
+        required: false
+      SMTP_USERNAME:
+        required: false
+      SMTP_PASSWORD:
+        required: false
+
+jobs:
+  # ── Determine Emoji & Color ───────────────────────────────────────
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set notification metadata
+        id: meta
+        run: |
+          STATUS="${{ inputs.status }}"
+          if [ "$STATUS" = "success" ]; then
+            echo "emoji=✅" >> $GITHUB_OUTPUT
+            echo "color=3066993" >> $GITHUB_OUTPUT   # Green
+            echo "color_hex=2ECC71" >> $GITHUB_OUTPUT
+          elif [ "$STATUS" = "failure" ]; then
+            echo "emoji=❌" >> $GITHUB_OUTPUT
+            echo "color=15158332" >> $GITHUB_OUTPUT  # Red
+            echo "color_hex=E74C3C" >> $GITHUB_OUTPUT
+          elif [ "$STATUS" = "cancelled" ]; then
+            echo "emoji=⚠️" >> $GITHUB_OUTPUT
+            echo "color=16776960" >> $GITHUB_OUTPUT  # Yellow
+            echo "color_hex=F1C40F" >> $GITHUB_OUTPUT
+          else
+            echo "emoji=ℹ️" >> $GITHUB_OUTPUT
+            echo "color=3447003" >> $GITHUB_OUTPUT   # Blue
+            echo "color_hex=3498DB" >> $GITHUB_OUTPUT
+          fi
+          TRIBE="${{ inputs.tribe }}"
+          SYSTEM="${{ inputs.system }}"
+          if [ -n "$TRIBE" ] && [ -n "$SYSTEM" ]; then
+            echo "context=$TRIBE / $SYSTEM" >> $GITHUB_OUTPUT
+          elif [ -n "$TRIBE" ]; then
+            echo "context=$TRIBE" >> $GITHUB_OUTPUT
+          else
+            echo "context=Platform" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Discord Notification ──────────────────────────────────────
+      - name: Notify Discord
+        if: ${{ secrets.DISCORD_WEBHOOK_URL != '' }}
+        run: |
+          PAYLOAD=$(cat <<EOF
+          {
+            "embeds": [{
+              "title": "${{ steps.meta.outputs.emoji }} ${{ inputs.pipeline }}",
+              "description": "Pipeline completed with status: **${{ inputs.status }}**",
+              "color": ${{ steps.meta.outputs.color }},
+              "fields": [
+                { "name": "Context",      "value": "${{ steps.meta.outputs.context }}", "inline": true },
+                { "name": "Environment",  "value": "${{ inputs.environment }}",          "inline": true },
+                { "name": "Version",      "value": "${{ inputs.version }}",              "inline": true },
+                { "name": "Triggered by", "value": "${{ github.actor }}",               "inline": true },
+                { "name": "Branch",       "value": "${{ github.ref_name }}",            "inline": true },
+                { "name": "Run",          "value": "[#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": true }
+              ],
+              "footer": { "text": "CI/CD Platform • GitHub Actions" },
+              "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            }]
+          }
+          EOF
+          )
+          curl -s -X POST "${{ secrets.DISCORD_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"
+
+      # ── Slack Notification ────────────────────────────────────────
+      - name: Notify Slack
+        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
+        run: |
+          PAYLOAD=$(cat <<EOF
+          {
+            "attachments": [{
+              "color": "#${{ steps.meta.outputs.color_hex }}",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": { "type": "plain_text", "text": "${{ steps.meta.outputs.emoji }} ${{ inputs.pipeline }}" }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": "*Status:*\n${{ inputs.status }}" },
+                    { "type": "mrkdwn", "text": "*Context:*\n${{ steps.meta.outputs.context }}" },
+                    { "type": "mrkdwn", "text": "*Environment:*\n${{ inputs.environment }}" },
+                    { "type": "mrkdwn", "text": "*Version:*\n${{ inputs.version }}" },
+                    { "type": "mrkdwn", "text": "*Branch:*\n${{ github.ref_name }}" },
+                    { "type": "mrkdwn", "text": "*Triggered by:*\n${{ github.actor }}" }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [{
+                    "type": "button",
+                    "text": { "type": "plain_text", "text": "View Run" },
+                    "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }]
+                }
+              ]
+            }]
+          }
+          EOF
+          )
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"
+
+      # ── Email Notification ────────────────────────────────────────
+      - name: Notify via Email
+        if: ${{ secrets.NOTIFY_EMAIL_TO != '' && secrets.SMTP_SERVER != '' }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port:    ${{ secrets.SMTP_PORT }}
+          username:       ${{ secrets.SMTP_USERNAME }}
+          password:       ${{ secrets.SMTP_PASSWORD }}
+          to:             ${{ secrets.NOTIFY_EMAIL_TO }}
+          from:           "CI/CD Platform <noreply@cicd-platform.dev>"
+          subject:        "${{ steps.meta.outputs.emoji }} [${{ inputs.status }}] ${{ inputs.pipeline }} — ${{ inputs.environment }}"
+          html_body: |
+            <html><body style="font-family:Arial,sans-serif;color:#333;">
+              <div style="background:#1E3A5F;padding:20px;border-radius:8px 8px 0 0;">
+                <h2 style="color:#fff;margin:0;">CI/CD Platform Notification</h2>
+              </div>
+              <div style="padding:20px;border:1px solid #ddd;border-radius:0 0 8px 8px;">
+                <h3 style="color:#${{ steps.meta.outputs.color_hex }};">
+                  ${{ steps.meta.outputs.emoji }} ${{ inputs.pipeline }}
+                </h3>
+                <table style="border-collapse:collapse;width:100%;">
+                  <tr><td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold;width:140px;">Status</td>
+                      <td style="padding:8px;border-bottom:1px solid #eee;color:#${{ steps.meta.outputs.color_hex }};font-weight:bold;">${{ inputs.status }}</td></tr>
+                  <tr><td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold;">Context</td>
+                      <td style="padding:8px;border-bottom:1px solid #eee;">${{ steps.meta.outputs.context }}</td></tr>
+                  <tr><td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold;">Environment</td>
+                      <td style="padding:8px;border-bottom:1px solid #eee;">${{ inputs.environment }}</td></tr>
+                  <tr><td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold;">Version</td>
+                      <td style="padding:8px;border-bottom:1px solid #eee;">${{ inputs.version }}</td></tr>
+                  <tr><td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold;">Branch</td>
+                      <td style="padding:8px;border-bottom:1px solid #eee;">${{ github.ref_name }}</td></tr>
+                  <tr><td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold;">Triggered by</td>
+                      <td style="padding:8px;border-bottom:1px solid #eee;">${{ github.actor }}</td></tr>
+                  <tr><td style="padding:8px;font-weight:bold;">Run</td>
+                      <td style="padding:8px;"><a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">#${{ github.run_number }} — View on GitHub</a></td></tr>
+                </table>
+              </div>
+            </body></html>

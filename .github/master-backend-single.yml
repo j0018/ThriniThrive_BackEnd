@@ -1,0 +1,420 @@
+########################################################################
+# MASTER BACKEND PIPELINE — SINGLE SYSTEM
+# Node.js + Docker + Supabase + AWS App Runner
+# Covers: test → uat → production with all gates and notifications.
+########################################################################
+name: ⚙️ Backend Master Pipeline
+
+on:
+  push:
+    branches: [test, uat, main]
+  pull_request:
+    branches: [test, uat, main]
+
+env:
+  TRIBE_NAME:    ${{ vars.TRIBE_NAME }}
+  SYSTEM_NAME:   ${{ vars.SYSTEM_NAME }}
+  APP_NAME:      ${{ vars.APP_NAME }}
+  AWS_REGION:    ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  APP_RUNNER_SERVICE_ARN_PREPROD: ${{ secrets.APP_RUNNER_SERVICE_ARN_PREPROD }}
+  APP_RUNNER_SERVICE_ARN_PROD: ${{ secrets.APP_RUNNER_SERVICE_ARN_PROD }}
+  IMAGE_TAG:     ${{ github.sha }}
+
+concurrency:
+  group: backend-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════
+  # TEST BRANCH
+  # ════════════════════════════════════════════════════════════════════
+  setup-cli:
+    name: "[TEST] Setup CLI & Verify Migrations"
+    if: github.ref == 'refs/heads/test' || (github.event_name == 'pull_request' && github.base_ref == 'test')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: npm install -g supabase
+      - name: Supabase DB lint
+        run: supabase db lint --schema public
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+  test-backend:
+    name: "[TEST] Run Jest Tests"
+    if: github.ref == 'refs/heads/test' || (github.event_name == 'pull_request' && github.base_ref == 'test')
+    runs-on: ubuntu-latest
+    needs: setup-cli
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-retries 5
+        ports: ["5432:5432"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: npm test -- --coverage --forceExit
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
+          API_CENTER_TOKEN: ${{ secrets.API_CENTER_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage-${{ github.run_number }}
+          path: coverage/
+          retention-days: 30
+
+  sonar-backend:
+    name: "[TEST] SonarCloud Analysis"
+    if: github.ref == 'refs/heads/test' || (github.event_name == 'pull_request' && github.base_ref == 'test')
+    runs-on: ubuntu-latest
+    needs: test-backend
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ vars.SONAR_ORG }}
+
+  quality-gate-backend:
+    name: "[TEST] Quality Gate Approval"
+    if: github.ref == 'refs/heads/test' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: sonar-backend
+    environment: test-quality-gate
+    steps:
+      - run: echo "✅ Backend quality gate approved"
+
+  deploy-replit-test:
+    name: "[TEST] Deploy to Replit (Test)"
+    if: github.ref == 'refs/heads/test' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: quality-gate-backend
+    environment:
+      name: test
+      url: ${{ vars.REPLIT_APP_URL_TEST }}
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - name: Deploy to Replit
+        run: |
+          curl -X POST "${{ secrets.REPLIT_DEPLOY_HOOK_TEST }}" \
+            -H "Authorization: Bearer ${{ secrets.REPLIT_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"branch":"test","env":"test"}'
+      - name: Register with API Center
+        run: |
+          curl -X POST "${{ vars.API_CENTER_URL }}/internal/register" \
+            -H "Authorization: Bearer ${{ secrets.API_CENTER_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "tribe": "${{ env.TRIBE_NAME }}",
+              "system": "${{ env.SYSTEM_NAME }}",
+              "base_url": "${{ vars.REPLIT_APP_URL_TEST }}",
+              "environment": "test"
+            }'
+      - uses: ncipollo/release-action@v1
+        with:
+          tag: "${{ env.TRIBE_NAME }}-${{ env.SYSTEM_NAME }}-backend-v${{ steps.version.outputs.VERSION }}-test"
+          name: "[${{ env.TRIBE_NAME }}/${{ env.SYSTEM_NAME }}] Backend Test v${{ steps.version.outputs.VERSION }}"
+          prerelease: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Register version
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.VERSION_REGISTRY_PAT }}
+          repository: ${{ vars.VERSION_REGISTRY_REPO }}
+          event-type: register-version
+          client-payload: |
+            { "tribe": "${{ env.TRIBE_NAME }}", "system": "${{ env.SYSTEM_NAME }}", "repo_type": "backend",
+              "version": "${{ steps.version.outputs.VERSION }}", "environment": "test",
+              "run_id": "${{ github.run_id }}", "deployed_by": "${{ github.actor }}" }
+
+  notify-backend-test:
+    name: "[TEST] Notify"
+    if: github.ref == 'refs/heads/test' && github.event_name == 'push' && always()
+    runs-on: ubuntu-latest
+    needs: [deploy-replit-test]
+    uses: ./.github/workflows/notify.yml
+    with:
+      status: ${{ needs.deploy-replit-test.result }}
+      pipeline: "${{ vars.TRIBE_NAME }}/${{ vars.SYSTEM_NAME }} Backend – Test"
+      environment: test
+      tribe: ${{ vars.TRIBE_NAME }}
+      system: ${{ vars.SYSTEM_NAME }}
+    secrets: inherit
+
+  # ════════════════════════════════════════════════════════════════════
+  # UAT BRANCH
+  # ════════════════════════════════════════════════════════════════════
+  migrate-uat:
+    name: "[UAT] Apply DB Migrations"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm install -g supabase
+      - run: supabase db push --db-url "${{ secrets.SUPABASE_DB_URL_UAT }}"
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+  deploy-replit-uat:
+    name: "[UAT] Deploy to Replit (UAT)"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: migrate-uat
+    environment:
+      name: uat
+      url: ${{ vars.REPLIT_APP_URL_UAT }}
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - run: |
+          curl -X POST "${{ secrets.REPLIT_DEPLOY_HOOK_UAT }}" \
+            -H "Authorization: Bearer ${{ secrets.REPLIT_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"branch":"uat","env":"uat"}'
+      - name: Register with API Center (UAT)
+        run: |
+          curl -X POST "${{ vars.API_CENTER_URL }}/internal/register" \
+            -H "Authorization: Bearer ${{ secrets.API_CENTER_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "tribe": "${{ env.TRIBE_NAME }}",
+              "system": "${{ env.SYSTEM_NAME }}",
+              "base_url": "${{ vars.REPLIT_APP_URL_UAT }}",
+              "environment": "uat"
+            }'
+
+  load-test-uat:
+    name: "[UAT] k6 Load Tests"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: deploy-replit-uat
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y k6
+      - run: k6 run tests/load/backend-load.js
+        env:
+          K6_BASE_URL: ${{ vars.REPLIT_APP_URL_UAT }}
+
+  qa-gate-uat-backend:
+    name: "[UAT] QA Developer Approval"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: load-test-uat
+    environment: uat-qa-gate
+    steps:
+      - run: echo "✅ UAT QA approved"
+
+  release-uat-backend:
+    name: "[UAT] GitHub Pre-Release"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: qa-gate-uat-backend
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - uses: ncipollo/release-action@v1
+        with:
+          tag: "${{ env.TRIBE_NAME }}-${{ env.SYSTEM_NAME }}-backend-v${{ steps.version.outputs.VERSION }}-uat"
+          name: "[${{ env.TRIBE_NAME }}/${{ env.SYSTEM_NAME }}] Backend UAT v${{ steps.version.outputs.VERSION }}"
+          prerelease: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  notify-backend-uat:
+    name: "[UAT] Notify"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push' && always()
+    runs-on: ubuntu-latest
+    needs: [release-uat-backend]
+    uses: ./.github/workflows/notify.yml
+    with:
+      status: ${{ needs.release-uat-backend.result }}
+      pipeline: "${{ vars.TRIBE_NAME }}/${{ vars.SYSTEM_NAME }} Backend – UAT"
+      environment: uat
+      tribe: ${{ vars.TRIBE_NAME }}
+      system: ${{ vars.SYSTEM_NAME }}
+    secrets: inherit
+
+  # ════════════════════════════════════════════════════════════════════
+  # PRODUCTION / MAIN BRANCH
+  # ════════════════════════════════════════════════════════════════════
+  build-docker:
+    name: "[PROD] Build & Push Docker Image"
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.base_ref == 'main')
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+      version: ${{ steps.version.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push image
+        id: build
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          IMAGE=$REGISTRY/$ECR_REPOSITORY:${{ steps.version.outputs.VERSION }}
+          docker build -t $IMAGE -t $REGISTRY/$ECR_REPOSITORY:latest .
+          docker push $IMAGE
+          docker push $REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+      - name: Push to GHCR (mirror)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.VERSION }}
+            ghcr.io/${{ github.repository }}:latest
+
+  deploy-preprod-backend:
+    name: "[PROD] Deploy Pre-Production (App Runner)"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: build-docker
+    environment: pre-production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy to App Runner (Pre-Production)
+        run: |
+          aws apprunner update-service \
+            --service-arn ${{ env.APP_RUNNER_SERVICE_ARN_PREPROD }} \
+            --source-configuration '{"ImageRepository":{"ImageIdentifier":"${{ needs.build-docker.outputs.image }}","ImageRepositoryType":"ECR","ImageConfiguration":{"Port":"3000"}}}' \
+            --region ${{ env.AWS_REGION }}
+      - name: Wait for pre-production deployment
+        run: |
+          aws apprunner wait service-updated \
+            --service-arn ${{ env.APP_RUNNER_SERVICE_ARN_PREPROD }} \
+            --region ${{ env.AWS_REGION }}
+
+  migrate-prod:
+    name: "[PROD] Apply DB Migrations (Production)"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: deploy-preprod-backend
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm install -g supabase
+      - run: supabase db push --db-url "${{ secrets.SUPABASE_DB_URL_PROD }}"
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+  governance-backend:
+    name: "[PROD] Governance / Change Control"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: migrate-prod
+    environment: governance
+    steps:
+      - run: echo "✅ Governance approved"
+
+  deploy-production-backend:
+    name: "[PROD] Deploy to True Live (App Runner)"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: governance-backend
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy to App Runner (Production)
+        run: |
+          aws apprunner update-service \
+            --service-arn ${{ env.APP_RUNNER_SERVICE_ARN_PROD }} \
+            --source-configuration '{"ImageRepository":{"ImageIdentifier":"${{ needs.build-docker.outputs.image }}","ImageRepositoryType":"ECR","ImageConfiguration":{"Port":"3000"}}}' \
+            --region ${{ env.AWS_REGION }}
+      - name: Wait for production deployment
+        run: |
+          aws apprunner wait service-updated \
+            --service-arn ${{ env.APP_RUNNER_SERVICE_ARN_PROD }} \
+            --region ${{ env.AWS_REGION }}
+      - name: Register with API Center (Production)
+        run: |
+          curl -X POST "${{ vars.API_CENTER_URL }}/internal/register" \
+            -H "Authorization: Bearer ${{ secrets.API_CENTER_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "tribe": "${{ env.TRIBE_NAME }}",
+              "system": "${{ env.SYSTEM_NAME }}",
+              "base_url": "${{ vars.PROD_API_BASE_URL }}",
+              "environment": "production"
+            }'
+      - uses: ncipollo/release-action@v1
+        with:
+          tag: "${{ env.TRIBE_NAME }}-${{ env.SYSTEM_NAME }}-backend-v${{ needs.build-docker.outputs.version }}"
+          name: "[${{ env.TRIBE_NAME }}/${{ env.SYSTEM_NAME }}] Backend Release v${{ needs.build-docker.outputs.version }}"
+          makeLatest: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Register production version
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.VERSION_REGISTRY_PAT }}
+          repository: ${{ vars.VERSION_REGISTRY_REPO }}
+          event-type: register-version
+          client-payload: |
+            { "tribe": "${{ env.TRIBE_NAME }}", "system": "${{ env.SYSTEM_NAME }}", "repo_type": "backend",
+              "version": "${{ needs.build-docker.outputs.version }}", "environment": "production",
+              "run_id": "${{ github.run_id }}", "deployed_by": "${{ github.actor }}" }
+
+  notify-backend-prod:
+    name: "[PROD] Notify"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && always()
+    runs-on: ubuntu-latest
+    needs: [deploy-production-backend]
+    uses: ./.github/workflows/notify.yml
+    with:
+      status: ${{ needs.deploy-production-backend.result }}
+      pipeline: "${{ vars.TRIBE_NAME }}/${{ vars.SYSTEM_NAME }} Backend – Production"
+      version: ${{ needs.build-docker.outputs.version }}
+      environment: production
+      tribe: ${{ vars.TRIBE_NAME }}
+      system: ${{ vars.SYSTEM_NAME }}
+    secrets: inherit
