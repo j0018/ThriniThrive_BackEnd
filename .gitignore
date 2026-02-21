@@ -1,0 +1,19 @@
+# Environment files — NEVER commit
+.env
+.env.*
+.env.local
+.env.production
+
+# Android signing keys — NEVER commit
+*.keystore
+*.jks
+android/app/release.keystore
+
+# Google Play service account
+service-account.json
+*.json.secret
+
+node_modules/
+dist/
+build/
+.vercel/
